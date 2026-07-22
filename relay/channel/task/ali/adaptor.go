@@ -1,4 +1,4 @@
-﻿package ali
+package ali
 
 import (
 	"bytes"
@@ -71,13 +71,13 @@ type AliNewVideoRequest struct {
 }
 
 type AliNewVideoInput struct {
-	Prompt         string         `json:"prompt,omitempty"`
-	NegativePrompt string         `json:"negative_prompt,omitempty"`
-	AudioURL       string         `json:"audio_url,omitempty"`
-	Media          []AliMediaItem `json:"media,omitempty"`
+	Prompt         string          `json:"prompt,omitempty"`
+	NegativePrompt string          `json:"negative_prompt,omitempty"`
+	AudioURL       string          `json:"audio_url,omitempty"`
+	Media          []AliVideoMedia `json:"media,omitempty"`
 }
 
-type AliMediaItem struct {
+type AliVideoMedia struct {
 	Type string `json:"type"`
 	URL  string `json:"url"`
 }
@@ -124,6 +124,26 @@ type AliUsage struct {
 	SR                  dto.IntValue    `json:"SR,omitempty"`
 	Ratio               dto.StringValue `json:"ratio,omitempty"`
 	VideoCount          dto.IntValue    `json:"video_count,omitempty"`
+}
+
+type AliMetadata struct {
+	// Input 相关
+	AudioURL       string          `json:"audio_url,omitempty"`       // 音频URL
+	ImgURL         string          `json:"img_url,omitempty"`         // 图片URL（图生视频）
+	FirstFrameURL  string          `json:"first_frame_url,omitempty"` // 首帧图片URL（首尾帧生视频）
+	LastFrameURL   string          `json:"last_frame_url,omitempty"`  // 尾帧图片URL（首尾帧生视频）
+	Media          []AliVideoMedia `json:"media,omitempty"`           // 媒体列表（wan2.7-i2v新协议）
+	NegativePrompt string          `json:"negative_prompt,omitempty"` // 反向提示词
+	Template       string          `json:"template,omitempty"`        // 视频特效模板
+
+	// Parameters 相关
+	Resolution   *string `json:"resolution,omitempty"`    // 分辨率: 480P/720P/1080P
+	Size         *string `json:"size,omitempty"`          // 尺寸: 如 "832*480"
+	Duration     *int    `json:"duration,omitempty"`      // 时长
+	PromptExtend *bool   `json:"prompt_extend,omitempty"` // 是否开启prompt智能改写
+	Watermark    *bool   `json:"watermark,omitempty"`     // 是否添加水印
+	Audio        *bool   `json:"audio,omitempty"`         // 是否添加音频
+	Seed         *int    `json:"seed,omitempty"`          // 随机数种子
 }
 
 // ============================
@@ -192,6 +212,8 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	return bytes.NewReader(bodyBytes), nil
 }
 
+// EstimateBilling 根据用户请求参数计算 OtherRatios（时长、分辨率等）。
+// 在 ValidateRequestAndSetAction 之后、价格计算之前调用。
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
 	taskReq, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
@@ -225,8 +247,10 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		audio = req.Parameters.Audio
 	}
 
+	// metadata can override Duration past standard request validation;
+	// cap it because it is used as a billing multiplier.
 	otherRatios := map[string]float64{
-		"seconds": float64(duration),
+		"seconds": float64(min(duration, relaycommon.MaxTaskDurationSeconds)),
 	}
 
 	ratios, err := ProcessAliOtherRatios(upstreamModel, size, resolution, audio)
@@ -684,7 +708,7 @@ func buildNewFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliNew
 		if mediaList, ok := tmpInput["media"].([]interface{}); ok {
 			for _, item := range mediaList {
 				if m, ok := item.(map[string]interface{}); ok {
-					var media AliMediaItem
+					var media AliVideoMedia
 					if t, ok := m["type"].(string); ok {
 						media.Type = t
 					}
@@ -742,7 +766,7 @@ func buildNewFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliNew
 		case "audio_url":
 			aliReq.Input.AudioURL = m.URL
 		}
-		aliReq.Input.Media = append(aliReq.Input.Media, AliMediaItem{
+		aliReq.Input.Media = append(aliReq.Input.Media, AliVideoMedia{
 			Type: m.Type,
 			URL:  m.URL,
 		})
