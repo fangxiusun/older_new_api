@@ -1,4 +1,4 @@
-﻿package router
+package router
 
 import (
 	"github.com/QuantumNous/new-api/controller"
