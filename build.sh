@@ -1,10 +1,11 @@
+#!/usr/bin/env bash
 # build.sh - Linux 本地一键编译脚本
-# 将前端（default + classic）和后端编译为单个可执行文件 new-api
+# 将 web 前端和 Go 后端编译为可执行文件 new-api
 #
 # 用法:
-#   ./build.sh                 # 完整编译（前端 + 后端）
-#   ./build.sh --skip-frontend # 仅编译后端（需已存在 web/default/dist 和 web/classic/dist）
-#   ./build.sh --frontend-only # 仅编译前端
+#   ./build.sh                         # 完整编译（前端 + 后端）
+#   ./build.sh --skip-frontend         # 仅编译后端（需已存在 web/dist/index.html）
+#   ./build.sh --frontend-only         # 仅编译前端
 #   ./build.sh --output-dir /tmp/output # 指定输出目录
 
 set -euo pipefail
@@ -46,94 +47,60 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── 颜色输出辅助 ──
 write_step() { echo -e "\033[36m\n>> $1\033[0m"; }
 write_ok()   { echo -e "\033[32m   OK: $1\033[0m"; }
 write_fail() { echo -e "\033[31m   FAIL: $1\033[0m"; }
 
-# ── 项目根目录 ──
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-# ── 读取版本号 ──
 VERSION=""
-
 if [[ -f VERSION ]]; then
   VERSION="$(tr -d '\r\n' < VERSION | xargs || true)"
 fi
-
 if [[ -z "${VERSION// }" ]]; then
   VERSION="$(git describe --tags --always 2>/dev/null || true)"
 fi
-
 if [[ -z "${VERSION// }" ]]; then
   VERSION="v0.0.0-dev"
 fi
-
 echo -e "\033[33mVersion: $VERSION\033[0m"
 
-# ── 前置检查 ──
 write_step "检查编译工具"
-
 if ! command -v go >/dev/null 2>&1; then
   write_fail "未找到 Go，请先安装 Go 1.25+"
   exit 1
 fi
 write_ok "Go: $(go version)"
 
-if ! command -v bun >/dev/null 2>&1; then
-  write_fail "未找到 Bun，请先安装 Bun (https://bun.sh)"
-  exit 1
-fi
-write_ok "Bun: v$(bun --version)"
-
-# ── 编译前端 ──
 if [[ "$SKIP_FRONTEND" == false ]]; then
-  write_step "删除上一次构建"
+  if ! command -v bun >/dev/null 2>&1; then
+    write_fail "未找到 Bun，请先安装 Bun (https://bun.sh)"
+    exit 1
+  fi
+  write_ok "Bun: v$(bun --version)"
 
-  if [[ -d web/default/dist ]]; then
-    rm -rf web/default/dist
-    write_ok "已删除 web/default/dist"
+  write_step "删除上一次前端构建"
+  if [[ -d web/dist ]]; then
+    rm -rf web/dist
+    write_ok "已删除 web/dist"
   fi
 
-  if [[ -d web/classic/dist ]]; then
-    rm -rf web/classic/dist
-    write_ok "已删除 web/classic/dist"
-  fi
-
-  write_step "安装前端依赖 (bun install)"
   pushd web >/dev/null
-  if ! bun install --frozen-lockfile; then
-    echo -e "\033[33m   frozen-lockfile 失败，尝试不加锁安装...\033[0m"
-    bun install
-  fi
-  popd >/dev/null
+  write_step "安装前端依赖 (bun install --frozen-lockfile)"
+  bun install --frozen-lockfile
   write_ok "前端依赖安装完成"
 
-  write_step "编译 default 前端"
-  pushd web/default >/dev/null
+  write_step "编译 web 前端"
   DISABLE_ESLINT_PLUGIN=true VITE_REACT_APP_VERSION="$VERSION" bun run build
+  write_ok "web 前端编译完成 -> web/dist"
   popd >/dev/null
-  write_ok "default 前端编译完成 -> web/default/dist"
-
-  write_step "编译 classic 前端"
-  pushd web/classic >/dev/null
-  VITE_REACT_APP_VERSION="$VERSION" bun run build
-  popd >/dev/null
-  write_ok "classic 前端编译完成 -> web/classic/dist"
 else
   write_step "跳过前端编译 (--skip-frontend)"
-
-  if [[ ! -f web/default/dist/index.html ]]; then
-    write_fail "web/default/dist/index.html 不存在，请先编译前端"
+  if [[ ! -f web/dist/index.html ]]; then
+    write_fail "web/dist/index.html 不存在，请先编译前端"
     exit 1
   fi
-
-  if [[ ! -f web/classic/dist/index.html ]]; then
-    write_fail "web/classic/dist/index.html 不存在，请先编译前端"
-    exit 1
-  fi
-
   write_ok "前端产物已存在，跳过"
 fi
 
@@ -142,9 +109,7 @@ if [[ "$FRONTEND_ONLY" == true ]]; then
   exit 0
 fi
 
-# ── 编译后端 ──
 write_step "编译 Go 后端 (CGO_ENABLED=0)"
-
 WINDOWS_OUTPUT_NAME="new-api.exe"
 LINUX_OUTPUT_NAME="new-api"
 
@@ -161,7 +126,6 @@ if [[ -f "$WINDOWS_OUTPUT_PATH" ]]; then
   rm -f "$WINDOWS_OUTPUT_PATH"
   write_ok "已删除 $WINDOWS_OUTPUT_PATH"
 fi
-
 if [[ -f "$LINUX_OUTPUT_PATH" ]]; then
   rm -f "$LINUX_OUTPUT_PATH"
   write_ok "已删除 $LINUX_OUTPUT_PATH"
@@ -177,9 +141,8 @@ write_ok "Windows 版本 Go 编译完成 -> $WINDOWS_OUTPUT_PATH"
 write_step "编译 Linux amd64"
 CGO_ENABLED=0 GOEXPERIMENT=greenteagc GOOS=linux GOARCH=amd64 \
   go build -ldflags "$LDFLAGS" -o "$LINUX_OUTPUT_PATH"
-write_ok "Linux 编译完成 -> $LINUX_OUTPUT_PATH"
+write_ok "Linux 版本 Go 编译完成 -> $LINUX_OUTPUT_PATH"
 
-# ── 完成 ──
 if command -v stat >/dev/null 2>&1; then
   SIZE_BYTES="$(stat -c%s "$LINUX_OUTPUT_PATH")"
   SIZE_MB="$(awk "BEGIN { printf \"%.1f\", $SIZE_BYTES / 1024 / 1024 }")"
