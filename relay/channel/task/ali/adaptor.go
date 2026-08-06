@@ -1,4 +1,4 @@
-package ali
+﻿package ali
 
 import (
 	"bytes"
@@ -860,6 +860,7 @@ func ProcessAliOtherRatios(model, size, resolution string, audio *bool) (map[str
 		"wanx2.1-t2v-turbo":  {"480P": 1, "720P": 1},
 		"wanx2.1-t2v-plus":   {"720P": 1},
 
+		"wan2.7-i2v":         {"720P": 1, "1080P": 1 / 0.6},
 		"wan2.6-i2v":         {"720P": 1, "1080P": 1 / 0.6},
 		"wan2.6-i2v-flash":   {"720P": 1, "1080P": 1 / 0.6},
 		"wan2.5-i2v-preview": {"480P": 1, "720P": 2, "1080P": 1 / 0.3},
