@@ -1,4 +1,4 @@
-﻿# New API — 接口说明文档
+# New API — 接口说明文档
 
 > 生成时间：2026-06-16
 > 追踪方式：基于 `router/*.go` 和 `controller/*.go` 源码逐路由提取
@@ -303,7 +303,9 @@
 | GET | `/api/perf-metrics/summary` | `controller.GetPerfMetricsSummary` | 性能指标摘要 |
 | GET | `/api/perf-metrics` | `controller.GetPerfMetrics` | 性能指标详情 |
 
-**查询参数**：`model_name`, `group`, `start_ts`, `end_ts`
+**认证**：`HeaderNavModulePublicOrUserAuth("pricing")`，由 option `HeaderNavModules.pricing.enabled/requireAuth` 决定是否可匿名；详见 `docs/llm-docs/29-perf-metrics-summary-auth.md`。
+
+**查询参数**：`hours`（summary）；`model`、`group`、`hours`（detail）
 
 **处理函数**：`controller/perf_metrics.go`
 

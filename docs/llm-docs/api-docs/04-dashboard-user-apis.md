@@ -19,7 +19,11 @@
 | `GET /api/rankings?period=week` | Header nav 权限 | `period` | 排行榜快照 | `controller/rankings.go` |
 | `GET /api/ratio_config` | Critical 限流 | 无 | 倍率配置 | `controller/ratio_config.go` |
 
-`/api/perf-metrics` 公开或登录可访问，取决于导航模块配置：
+`/api/perf-metrics` 是否需要登录，取决于系统 option `HeaderNavModules.pricing`（中间件 `HeaderNavModulePublicOrUserAuth("pricing")`）：
+
+- 默认 / `enabled=true` 且 `requireAuth=false`：可匿名（`TryUserAuth`）
+- `requireAuth=true` 或 `enabled=false`：必须登录（`UserAuth`，未登录 401）
+- 详细调查见 `docs/llm-docs/29-perf-metrics-summary-auth.md`
 
 | 接口 | 输入 | 输出 | 代码 |
 | --- | --- | --- | --- |
