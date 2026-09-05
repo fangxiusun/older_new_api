@@ -18,6 +18,7 @@
 9. [视频任务提交](#9-视频任务提交)
 10. [视频任务轮询](#10-视频任务轮询)
 11. [视频任务查询返回](#11-视频任务查询返回)
+12. [视频任务 Image/Images → Media 与 Size/Duration/Seconds → Metadata 迁移](#12-视频任务-imageimages--media-与-sizedurationseconds--metadata-迁移)
 
 ---
 
@@ -897,6 +898,42 @@ videoV1Router.GET("/videos/:task_id", controller.RelayTaskFetch)
 ```
 
 ---
+
+## 12. 视频任务 Image/Images → Media 与 Size/Duration/Seconds → Metadata 迁移
+
+为兼容仅提供标准化字段的调用格式（如 Sora 风格请求），在 `buildNewFormatRequest` /
+`buildOldFormatRequest` 之前依次执行（`relay/channel/task/ali/adaptor.go`）：
+
+1. `migrateTaskImagesToMedia(model, &taskReq)`：将 `Image` / `Images` 迁移到 `Media`。
+   - `firstTaskImage` / `secondTaskImage`：将 `req.Image`、`req.Images` 按此顺序拼接，
+     取第一个 / 第二个非空值。
+   - **仅当 `req.Media` 为空时迁移**，已有 `Media` 的请求原样跳过；迁移完成后清空
+     `Image` / `Images`。
+   - 当前仅支持**图片参考**，不支持视频参考与视频编辑；`input_reference` 不参与迁移，
+     仍被 build*Request 拒绝。
+
+按模型的 Media 映射：
+
+| 模型 | firstTaskImage | secondTaskImage |
+| --- | --- | --- |
+| wan2.6-i2v-flash / wan2.6-i2v / wan2.5-i2v-preview / wan2.2-i2v-flash / wan2.2-i2v-plus / wan2.1-i2v-turbo / wan2.1-i2v-plus | `{Type: img_url}` | — |
+| wan2.2-kf2v-flash / wan2.1-kf2v-plus | `{Type: first_frame_url}` | `{Type: last_frame_url}` |
+| wan2.7-i2v / wan2.7-i2v-2026-04-25 | 图片→`{Type: first_frame}`；视频→`{Type: first_clip}` | `{Type: last_frame}` |
+| happyhorse-1.1-i2v / happyhorse-1.0-i2v | `{Type: first_frame}` | — |
+| wan3.0-video / wan3.0-video-prime | `{Type: first_frame}` | `{Type: last_frame}` |
+| 其他模型 | 不迁移（保持原有校验行为） | |
+
+wan2.7 系的图片/视频判断（`looksLikeVideoURL`）：优先 data URI 的 MIME
+（`data:video/*` → 视频，`data:image/*` → 图片），其次 URL 后缀
+（`.mp4`/`.mov`/`.webm`/`.avi`/`.mkv`/`.m4v` → 视频），默认按图片处理。
+
+2. `migrateTaskParamsToMetadata(&taskReq)`：将 `Size` → `metadata.size`、
+   `Duration`（为 0 时用 `Seconds` 兜底）→ `metadata.duration`，**Metadata 已有对应
+   键时不覆盖**；转移后清空原字段。两种格式通用（旧格式读取 `size`/`duration`，
+   新格式读取 `duration`）。
+
+迁移后 build*Request 不再因 `image`/`images`/`size`/`duration`/`seconds` 遗留字段报错；
+`mode` 与 `input_reference` 仍被拒绝。
 
 ## 附录：关键 DTO 结构速查
 

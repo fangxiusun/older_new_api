@@ -196,6 +196,8 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	}
 
 	var reqBody any
+	migrateTaskImagesToMedia(upstreamModel, &taskReq)
+	migrateTaskParamsToMetadata(&taskReq)
 	if isNewFormatModel(upstreamModel) {
 		reqBody, err = buildNewFormatRequest(upstreamModel, taskReq)
 	} else {
@@ -232,6 +234,8 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 	var audio *bool
 
 	if isNewFormatModel(upstreamModel) {
+		migrateTaskImagesToMedia(upstreamModel, &taskReq)
+		migrateTaskParamsToMetadata(&taskReq)
 		req, err := buildNewFormatRequest(upstreamModel, taskReq)
 		if err != nil {
 			return nil
@@ -239,6 +243,8 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		resolution = req.Parameters.Resolution
 		duration = req.Parameters.Duration
 	} else {
+		migrateTaskImagesToMedia(upstreamModel, &taskReq)
+		migrateTaskParamsToMetadata(&taskReq)
 		req, err := buildOldFormatRequest(upstreamModel, taskReq)
 		if err != nil {
 			return nil
@@ -502,6 +508,154 @@ func toInt(v interface{}) (int, bool) {
 	}
 }
 
+// ============================
+// Image/Images/InputReference → Media 迁移
+// ============================
+
+// 仅支持图片参考，不支持视频参考与视频编辑：
+var aliImageRefModels = []string{
+	"wan2.6-i2v-flash", "wan2.6-i2v", "wan2.5-i2v-preview",
+	"wan2.2-i2v-flash", "wan2.2-i2v-plus", "wan2.1-i2v-turbo", "wan2.1-i2v-plus",
+}
+
+// 首尾帧模型：first → first_frame_url，second → last_frame_url（wan2.x 系旧格式），
+// wan3.0 系新格式为 first_frame / last_frame。
+var aliKF2VModels = []string{"wan2.2-kf2v-flash", "wan2.1-kf2v-plus"}
+
+// wan2.7-i2v：首帧/首片段自动判断图片或视频。
+var aliFirstClipModels = []string{"wan2.7-i2v", "wan2.7-i2v-2026-04-25"}
+
+// 仅首帧模型（新格式）。
+var aliFirstFrameOnlyModels = []string{"happyhorse-1.1-i2v", "happyhorse-1.0-i2v"}
+
+var aliNewFirstLastFrameModels = []string{"wan3.0-video", "wan3.0-video-prime"}
+
+// taskImagePool 将 req.Image、req.Images 顺序拼接为图片来源数组。
+func taskImagePool(req relaycommon.TaskSubmitReq) []string {
+	pool := make([]string, 0, len(req.Images)+1)
+	if req.Image != "" {
+		pool = append(pool, req.Image)
+	}
+	pool = append(pool, req.Images...)
+	return pool
+}
+
+// firstTaskImage 返回 Image/Images 顺序拼接后第一个非空值。
+func firstTaskImage(req relaycommon.TaskSubmitReq) string {
+	for _, img := range taskImagePool(req) {
+		if img != "" {
+			return img
+		}
+	}
+	return ""
+}
+
+// secondTaskImage 返回 Image/Images 顺序拼接后第二个非空值。
+func secondTaskImage(req relaycommon.TaskSubmitReq) string {
+	found := 0
+	for _, img := range taskImagePool(req) {
+		if img == "" {
+			continue
+		}
+		found++
+		if found == 2 {
+			return img
+		}
+	}
+	return ""
+}
+
+// looksLikeVideoURL 判断首帧来源是视频还是图片：优先 data URI 的 MIME，
+// 其次 URL 后缀，默认按图片处理。
+func looksLikeVideoURL(url string) bool {
+	lower := strings.ToLower(url)
+	if strings.HasPrefix(lower, "data:video/") {
+		return true
+	}
+	if strings.HasPrefix(lower, "data:image/") {
+		return false
+	}
+	for _, ext := range []string{".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// migrateTaskImagesToMedia 将 TaskSubmitReq 中的 Image/Images/InputReference 迁移到
+// Media，便于兼容仅提供 image/images/input_reference 的调用格式（当前仅支持图片参考，
+// 不支持视频参考与视频编辑）。req.Media 非空时跳过；迁移后清空原字段。
+// 必须在 buildNewFormatRequest / buildOldFormatRequest 之前调用。
+func migrateTaskImagesToMedia(model string, req *relaycommon.TaskSubmitReq) {
+	if len(req.Media) > 0 {
+		return
+	}
+	first, second := firstTaskImage(*req), secondTaskImage(*req)
+	if first == "" {
+		return
+	}
+
+	switch {
+	case strContains(aliImageRefModels, model):
+		req.Media = append(req.Media, relaycommon.Media{Type: "img_url", URL: first})
+	case strContains(aliKF2VModels, model):
+		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame_url", URL: first})
+		if second != "" {
+			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame_url", URL: second})
+		}
+	case strContains(aliFirstClipModels, model):
+		if looksLikeVideoURL(first) {
+			req.Media = append(req.Media, relaycommon.Media{Type: "first_clip", URL: first})
+		} else {
+			req.Media = append(req.Media, relaycommon.Media{Type: "first_frame", URL: first})
+		}
+		if second != "" {
+			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame", URL: second})
+		}
+	case strContains(aliFirstFrameOnlyModels, model):
+		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame", URL: first})
+	case strContains(aliNewFirstLastFrameModels, model):
+		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame", URL: first})
+		if second != "" {
+			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame", URL: second})
+		}
+	default:
+		// 未收录的模型不做迁移，保持原有校验行为
+		return
+	}
+
+	req.Image = ""
+	req.Images = nil
+}
+
+// migrateTaskParamsToMetadata 将 TaskSubmitReq 中的 Size/Duration/Seconds 转移到
+// Metadata（键 size/duration），兼容仅提供标准字段的调用格式；Metadata 已有对应
+// 键时以 Metadata 为准，不覆盖。转移后清空原字段，必须在 buildNewFormatRequest /
+// buildOldFormatRequest 之前调用。
+func migrateTaskParamsToMetadata(req *relaycommon.TaskSubmitReq) {
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]interface{})
+	}
+	if req.Size != "" {
+		if _, ok := req.Metadata["size"]; !ok {
+			req.Metadata["size"] = req.Size
+		}
+		req.Size = ""
+	}
+	if req.Duration > 0 {
+		if _, ok := req.Metadata["duration"]; !ok {
+			req.Metadata["duration"] = req.Duration
+		}
+	} else if req.Seconds != "" {
+		if _, ok := req.Metadata["duration"]; !ok {
+			req.Metadata["duration"] = req.Seconds
+		}
+	}
+	req.Duration = 0
+	req.Seconds = ""
+}
+
 // buildOldFormatRequest 构建旧格式请求 (wan2.1 ~ wan2.6)
 func buildOldFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliOldVideoRequest, error) {
 	aliReq := &AliOldVideoRequest{
@@ -644,21 +798,6 @@ func buildOldFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliOld
 	if req.Mode != "" {
 		return nil, fmt.Errorf("Parameter Key [ mode ] is unused")
 	}
-	if req.Image != "" {
-		return nil, fmt.Errorf("Parameter Key [ image ] is unused, use media please")
-	}
-	if len(req.Images) > 0 {
-		return nil, fmt.Errorf("Parameter Key [ images ] is unused, use media please")
-	}
-	if req.Size != "" {
-		return nil, fmt.Errorf("Parameter Key [ size ] is unused, use metadata please")
-	}
-	if req.Duration > 0 {
-		return nil, fmt.Errorf("Parameter Key [ duration ] is unused, use metadata please")
-	}
-	if req.Seconds != "" {
-		return nil, fmt.Errorf("Parameter Key [ seconds ] is unused, use metadata please")
-	}
 	if req.InputReference != "" {
 		return nil, fmt.Errorf("Parameter Key [ input_reference ] is unused, use media please")
 	}
@@ -778,21 +917,6 @@ func buildNewFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliNew
 	if req.Mode != "" {
 		return nil, fmt.Errorf("Parameter Key [ mode ] is unused")
 	}
-	if req.Image != "" {
-		return nil, fmt.Errorf("Parameter Key [ image ] is unused, use media please")
-	}
-	if len(req.Images) > 0 {
-		return nil, fmt.Errorf("Parameter Key [ images ] is unused, use media please")
-	}
-	if req.Size != "" {
-		return nil, fmt.Errorf("Parameter Key [ size ] is unused, use metadata please")
-	}
-	if req.Duration > 0 {
-		return nil, fmt.Errorf("Parameter Key [ duration ] is unused, use metadata please")
-	}
-	if req.Seconds != "" {
-		return nil, fmt.Errorf("Parameter Key [ seconds ] is unused, use metadata please")
-	}
 	if req.InputReference != "" {
 		return nil, fmt.Errorf("Parameter Key [ input_reference ] is unused, use media please")
 	}
@@ -856,6 +980,9 @@ func ProcessAliOtherRatios(model, size, resolution string, audio *bool) (map[str
 	otherRatios := make(map[string]float64)
 
 	aliRatios := map[string]map[string]float64{
+		"wan3.0-video":       {"480P": 1, "720P": 2, "1080P": 4},
+		"wan3.0-video-prime": {"480P": 1, "720P": 2, "1080P": 4},
+
 		"wan2.7-t2v":         {"720P": 1, "1080P": 1 / 0.6},
 		"wan2.6-t2v":         {"720P": 1, "1080P": 1 / 0.6},
 		"wan2.5-t2v-preview": {"480P": 1, "720P": 2, "1080P": 1 / 0.3},

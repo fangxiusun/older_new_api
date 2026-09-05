@@ -1,6 +1,9 @@
 package ali
 
 var ModelList = []string{
+	"wan3.0-video",       // 万相3.0是 all-in-one 视频生成模型
+	"wan3.0-video-prime", // Wan3.0-Video-Prime 是万相3.0 的高速版视频生成模型
+
 	// wan2.7 系列 (新格式 - media 数组)
 	"wan2.7-i2v", // 万相2.7图生视频
 	"wan2.7-t2v", // 万相2.7文生视频
