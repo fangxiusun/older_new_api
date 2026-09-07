@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"sort"
@@ -233,9 +234,9 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 	var duration int
 	var audio *bool
 
+	migrateTaskImagesToMedia(upstreamModel, &taskReq)
+	migrateTaskParamsToMetadata(&taskReq)
 	if isNewFormatModel(upstreamModel) {
-		migrateTaskImagesToMedia(upstreamModel, &taskReq)
-		migrateTaskParamsToMetadata(&taskReq)
 		req, err := buildNewFormatRequest(upstreamModel, taskReq)
 		if err != nil {
 			return nil
@@ -243,8 +244,6 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		resolution = req.Parameters.Resolution
 		duration = req.Parameters.Duration
 	} else {
-		migrateTaskImagesToMedia(upstreamModel, &taskReq)
-		migrateTaskParamsToMetadata(&taskReq)
 		req, err := buildOldFormatRequest(upstreamModel, taskReq)
 		if err != nil {
 			return nil
@@ -449,7 +448,7 @@ func boolPtr(b bool) *bool { return &b }
 
 // isNewFormatModel 判断是否为新格式模型 (wan2.7+ 或 happyhorse)
 func isNewFormatModel(model string) bool {
-	return strings.HasPrefix(model, "wan2.7") || strings.HasPrefix(model, "happyhorse")
+	return strings.HasPrefix(model, "wan2.7") || strings.HasPrefix(model, "wan3.0") || strings.HasPrefix(model, "happyhorse")
 }
 
 // getAliVideoEndpoint 根据模型返回对应的 API 路径
@@ -515,12 +514,12 @@ func toInt(v interface{}) (int, bool) {
 // 仅支持图片参考，不支持视频参考与视频编辑：
 var aliImageRefModels = []string{
 	"wan2.6-i2v-flash", "wan2.6-i2v", "wan2.5-i2v-preview",
-	"wan2.2-i2v-flash", "wan2.2-i2v-plus", "wan2.1-i2v-turbo", "wan2.1-i2v-plus",
+	"wan2.2-i2v-flash", "wan2.2-i2v-plus", "wanx2.1-i2v-turbo", "wanx2.1-i2v-plus",
 }
 
 // 首尾帧模型：first → first_frame_url，second → last_frame_url（wan2.x 系旧格式），
 // wan3.0 系新格式为 first_frame / last_frame。
-var aliKF2VModels = []string{"wan2.2-kf2v-flash", "wan2.1-kf2v-plus"}
+var aliKF2VModels = []string{"wan2.2-kf2v-flash", "wanx2.1-kf2v-plus"}
 
 // wan2.7-i2v：首帧/首片段自动判断图片或视频。
 var aliFirstClipModels = []string{"wan2.7-i2v", "wan2.7-i2v-2026-04-25"}
@@ -536,8 +535,23 @@ func taskImagePool(req relaycommon.TaskSubmitReq) []string {
 	if req.Image != "" {
 		pool = append(pool, req.Image)
 	}
-	pool = append(pool, req.Images...)
+	for i, img := range req.Images {
+		// 通用校验会将单个 image 同时写入 images[0]，不能把该别名当成尾帧。
+		if i == 0 && img == req.Image {
+			continue
+		}
+		pool = append(pool, img)
+	}
 	return pool
+}
+
+func matchesAliModel(model string, families []string) bool {
+	for _, family := range families {
+		if model == family || strings.HasPrefix(model, family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // firstTaskImage 返回 Image/Images 顺序拼接后第一个非空值。
@@ -567,13 +581,16 @@ func secondTaskImage(req relaycommon.TaskSubmitReq) string {
 
 // looksLikeVideoURL 判断首帧来源是视频还是图片：优先 data URI 的 MIME，
 // 其次 URL 后缀，默认按图片处理。
-func looksLikeVideoURL(url string) bool {
-	lower := strings.ToLower(url)
+func looksLikeVideoURL(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
 	if strings.HasPrefix(lower, "data:video/") {
 		return true
 	}
 	if strings.HasPrefix(lower, "data:image/") {
 		return false
+	}
+	if parsed, err := url.Parse(rawURL); err == nil {
+		lower = strings.ToLower(parsed.Path)
 	}
 	for _, ext := range []string{".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"} {
 		if strings.HasSuffix(lower, ext) {
@@ -583,12 +600,13 @@ func looksLikeVideoURL(url string) bool {
 	return false
 }
 
-// migrateTaskImagesToMedia 将 TaskSubmitReq 中的 Image/Images/InputReference 迁移到
-// Media，便于兼容仅提供 image/images/input_reference 的调用格式（当前仅支持图片参考，
-// 不支持视频参考与视频编辑）。req.Media 非空时跳过；迁移后清空原字段。
+// migrateTaskImagesToMedia 将 TaskSubmitReq 中的 Image/Images 迁移到 Media。
+// req.Media 非空时优先使用显式媒体；迁移后清空原字段。input_reference 仍由构建层拒绝。
 // 必须在 buildNewFormatRequest / buildOldFormatRequest 之前调用。
 func migrateTaskImagesToMedia(model string, req *relaycommon.TaskSubmitReq) {
 	if len(req.Media) > 0 {
+		req.Image = ""
+		req.Images = nil
 		return
 	}
 	first, second := firstTaskImage(*req), secondTaskImage(*req)
@@ -597,14 +615,14 @@ func migrateTaskImagesToMedia(model string, req *relaycommon.TaskSubmitReq) {
 	}
 
 	switch {
-	case strContains(aliImageRefModels, model):
+	case matchesAliModel(model, aliImageRefModels):
 		req.Media = append(req.Media, relaycommon.Media{Type: "img_url", URL: first})
-	case strContains(aliKF2VModels, model):
+	case matchesAliModel(model, aliKF2VModels):
 		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame_url", URL: first})
 		if second != "" {
 			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame_url", URL: second})
 		}
-	case strContains(aliFirstClipModels, model):
+	case matchesAliModel(model, aliFirstClipModels):
 		if looksLikeVideoURL(first) {
 			req.Media = append(req.Media, relaycommon.Media{Type: "first_clip", URL: first})
 		} else {
@@ -613,9 +631,9 @@ func migrateTaskImagesToMedia(model string, req *relaycommon.TaskSubmitReq) {
 		if second != "" {
 			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame", URL: second})
 		}
-	case strContains(aliFirstFrameOnlyModels, model):
+	case matchesAliModel(model, aliFirstFrameOnlyModels):
 		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame", URL: first})
-	case strContains(aliNewFirstLastFrameModels, model):
+	case matchesAliModel(model, aliNewFirstLastFrameModels):
 		req.Media = append(req.Media, relaycommon.Media{Type: "first_frame", URL: first})
 		if second != "" {
 			req.Media = append(req.Media, relaycommon.Media{Type: "last_frame", URL: second})
@@ -634,12 +652,22 @@ func migrateTaskImagesToMedia(model string, req *relaycommon.TaskSubmitReq) {
 // 键时以 Metadata 为准，不覆盖。转移后清空原字段，必须在 buildNewFormatRequest /
 // buildOldFormatRequest 之前调用。
 func migrateTaskParamsToMetadata(req *relaycommon.TaskSubmitReq) {
+	// TaskSubmitReq 从 context 按值取出，但 map 仍共享；避免估算污染后续重试。
+	req.Metadata = maps.Clone(req.Metadata)
 	if req.Metadata == nil {
 		req.Metadata = make(map[string]interface{})
 	}
 	if req.Size != "" {
-		if _, ok := req.Metadata["size"]; !ok {
-			req.Metadata["size"] = req.Size
+		_, hasSize := req.Metadata["size"]
+		_, hasResolution := req.Metadata["resolution"]
+		if !hasSize && !hasResolution {
+			size := strings.ToUpper(strings.TrimSpace(req.Size))
+			switch size {
+			case "480", "720", "1080", "480P", "720P", "1080P":
+				req.Metadata["resolution"] = strings.TrimSuffix(size, "P") + "P"
+			default:
+				req.Metadata["size"] = strings.ReplaceAll(size, "X", "*")
+			}
 		}
 		req.Size = ""
 	}
@@ -735,6 +763,7 @@ func buildOldFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliOld
 			aliReq.Parameters.Resolution = strings.ToUpper(v)
 		}
 		if v, ok := req.Metadata["size"].(string); ok {
+			v = strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(v)), "X", "*")
 			if strings.Contains(v, "*") {
 				aliReq.Parameters.Size = v
 			}
@@ -798,12 +827,23 @@ func buildOldFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliOld
 	if req.Mode != "" {
 		return nil, fmt.Errorf("Parameter Key [ mode ] is unused")
 	}
+	if req.Image != "" || len(req.Images) > 0 {
+		return nil, fmt.Errorf("image/images are not supported for model %s; use media", model)
+	}
 	if req.InputReference != "" {
 		return nil, fmt.Errorf("Parameter Key [ input_reference ] is unused, use media please")
 	}
 
 	if aliReq.Parameters.Resolution == "" {
-		aliReq.Parameters.Resolution = defaultResolution(model)
+		if aliReq.Parameters.Size != "" {
+			resolution, err := sizeToResolution(aliReq.Parameters.Size)
+			if err != nil {
+				return nil, err
+			}
+			aliReq.Parameters.Resolution = resolution
+		} else {
+			aliReq.Parameters.Resolution = defaultResolution(model)
+		}
 	}
 
 	if aliReq.Parameters.Duration <= 0 {
@@ -914,8 +954,40 @@ func buildNewFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliNew
 		})
 	}
 
+	if size, ok := req.Metadata["size"].(string); ok && size != "" {
+		size = strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(size)), "X", "*")
+		resolution, err := sizeToResolution(size)
+		if err != nil {
+			return nil, err
+		}
+		if aliReq.Parameters.Resolution == "" {
+			aliReq.Parameters.Resolution = resolution
+		}
+		if aliReq.Parameters.Ratio == "" {
+			// sizeToResolution 已限定合法尺寸；像素尺寸对应官方的五个宽高比档位。
+			dimensions := strings.Split(size, "*")
+			width, _ := strconv.Atoi(dimensions[0])
+			height, _ := strconv.Atoi(dimensions[1])
+			switch {
+			case width == height:
+				aliReq.Parameters.Ratio = "1:1"
+			case width*2 > height*3:
+				aliReq.Parameters.Ratio = "16:9"
+			case height*2 > width*3:
+				aliReq.Parameters.Ratio = "9:16"
+			case width > height:
+				aliReq.Parameters.Ratio = "4:3"
+			default:
+				aliReq.Parameters.Ratio = "3:4"
+			}
+		}
+	}
+
 	if req.Mode != "" {
 		return nil, fmt.Errorf("Parameter Key [ mode ] is unused")
+	}
+	if req.Image != "" || len(req.Images) > 0 {
+		return nil, fmt.Errorf("image/images are not supported for model %s; use media", model)
 	}
 	if req.InputReference != "" {
 		return nil, fmt.Errorf("Parameter Key [ input_reference ] is unused, use media please")
@@ -935,6 +1007,10 @@ func buildNewFormatRequest(model string, req relaycommon.TaskSubmitReq) (*AliNew
 // defaultResolution 返回模型的默认分辨率
 func defaultResolution(model string) string {
 	switch {
+	case strings.HasPrefix(model, "wan3.0"):
+		return "1080P"
+	case strings.HasPrefix(model, "wan2.7"):
+		return "1080P"
 	case strings.HasPrefix(model, "wan2.6"):
 		return "1080P"
 	case strings.HasPrefix(model, "wan2.5"):

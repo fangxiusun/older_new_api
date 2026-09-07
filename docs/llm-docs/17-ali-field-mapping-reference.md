@@ -906,34 +906,38 @@ videoV1Router.GET("/videos/:task_id", controller.RelayTaskFetch)
 
 1. `migrateTaskImagesToMedia(model, &taskReq)`：将 `Image` / `Images` 迁移到 `Media`。
    - `firstTaskImage` / `secondTaskImage`：将 `req.Image`、`req.Images` 按此顺序拼接，
-     取第一个 / 第二个非空值。
-   - **仅当 `req.Media` 为空时迁移**，已有 `Media` 的请求原样跳过；迁移完成后清空
-     `Image` / `Images`。
-   - 当前仅支持**图片参考**，不支持视频参考与视频编辑；`input_reference` 不参与迁移，
+     去除通用校验生成的首项别名后，取第一个 / 第二个非空值，避免单张图片被重复用作尾帧。
+   - **仅当 `req.Media` 为空时迁移**；已有 `Media` 时优先使用显式媒体。
+     成功迁移或采用显式媒体后清空 `Image` / `Images`。
+   - 标准字段迁移覆盖**图片参考、首尾帧**，以及 wan2.7-i2v 的首片段；
+     其他视频参考与视频编辑应显式使用 `media`。`input_reference` 不参与迁移，
      仍被 build*Request 拒绝。
 
 按模型的 Media 映射：
 
 | 模型 | firstTaskImage | secondTaskImage |
 | --- | --- | --- |
-| wan2.6-i2v-flash / wan2.6-i2v / wan2.5-i2v-preview / wan2.2-i2v-flash / wan2.2-i2v-plus / wan2.1-i2v-turbo / wan2.1-i2v-plus | `{Type: img_url}` | — |
-| wan2.2-kf2v-flash / wan2.1-kf2v-plus | `{Type: first_frame_url}` | `{Type: last_frame_url}` |
+| wan2.6-i2v-flash / wan2.6-i2v / wan2.5-i2v-preview / wan2.2-i2v-flash / wan2.2-i2v-plus / wanx2.1-i2v-turbo / wanx2.1-i2v-plus | `{Type: img_url}` | — |
+| wan2.2-kf2v-flash / wanx2.1-kf2v-plus | `{Type: first_frame_url}` | `{Type: last_frame_url}` |
 | wan2.7-i2v / wan2.7-i2v-2026-04-25 | 图片→`{Type: first_frame}`；视频→`{Type: first_clip}` | `{Type: last_frame}` |
 | happyhorse-1.1-i2v / happyhorse-1.0-i2v | `{Type: first_frame}` | — |
 | wan3.0-video / wan3.0-video-prime | `{Type: first_frame}` | `{Type: last_frame}` |
 | 其他模型 | 不迁移（保持原有校验行为） | |
 
+模型匹配也接受以 `-` 连接的日期等后缀。Wan 3.0 使用新格式构建器，媒体数组会进入实际请求体。
+
 wan2.7 系的图片/视频判断（`looksLikeVideoURL`）：优先 data URI 的 MIME
 （`data:video/*` → 视频，`data:image/*` → 图片），其次 URL 后缀
-（`.mp4`/`.mov`/`.webm`/`.avi`/`.mkv`/`.m4v` → 视频），默认按图片处理。
+（忽略查询参数与 fragment；`.mp4`/`.mov`/`.webm`/`.avi`/`.mkv`/`.m4v` → 视频），默认按图片处理。
 
-2. `migrateTaskParamsToMetadata(&taskReq)`：将 `Size` → `metadata.size`、
-   `Duration`（为 0 时用 `Seconds` 兜底）→ `metadata.duration`，**Metadata 已有对应
-   键时不覆盖**；转移后清空原字段。两种格式通用（旧格式读取 `size`/`duration`，
-   新格式读取 `duration`）。
+2. `migrateTaskParamsToMetadata(&taskReq)`：先复制 metadata，避免计费估算修改 context 中缓存的原请求。
+   `Size` 为 `720P` 等档位时写入 `metadata.resolution`；像素尺寸写入 `metadata.size`，
+   并统一 `x`/`X` 为 `*`。已有 `metadata.size` 或 `metadata.resolution` 优先。
+   新格式将像素尺寸转换为分辨率和宽高比；旧格式保留像素尺寸并同步分辨率。
+   `Duration`（为 0 时用 `Seconds` 兜底）写入 `metadata.duration`，已有值不覆盖。
+   转移后清空对应标准字段。
 
-迁移后 build*Request 不再因 `image`/`images`/`size`/`duration`/`seconds` 遗留字段报错；
-`mode` 与 `input_reference` 仍被拒绝。
+未能迁移的 `image`/`images` 仍会被拒绝，防止静默丢图；`mode` 与 `input_reference` 仍被拒绝。
 
 ## 附录：关键 DTO 结构速查
 

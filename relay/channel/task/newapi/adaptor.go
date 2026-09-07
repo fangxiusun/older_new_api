@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"mime/multipart"
+	"mime"
 	"net/http"
-	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -15,8 +15,10 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/task/ali"
 	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
@@ -29,15 +31,22 @@ import (
 // ============================
 
 // responseTask 是上游 new-api 提交/查询接口返回的 OpenAI video 对象。
+// 仅提取任务状态等必要字段；对外响应和入库均保留原始 JSON，不按此结构重新序列化。
 type responseTask struct {
-	ID        string `json:"id"`
-	TaskID    string `json:"task_id,omitempty"` // 兼容旧接口
-	Object    string `json:"object"`
-	Model     string `json:"model"`
-	Status    string `json:"status"`
-	Progress  int    `json:"progress"`
-	CreatedAt int64  `json:"created_at"`
-	Error     *struct {
+	ID       string `json:"id"`
+	TaskID   string `json:"task_id,omitempty"` // 兼容旧接口
+	Object   string `json:"object"`
+	Model    string `json:"model"`
+	Status   string `json:"status"`
+	Progress int    `json:"progress"`
+	// created_at 在不同响应中可能是 RFC3339 字符串或 Unix 秒，保留原文而不强制解码。
+	Output struct {
+		VideoURL string `json:"video_url"`
+	} `json:"output"`
+	Metadata struct {
+		URL string `json:"url"`
+	} `json:"metadata"`
+	Error *struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
@@ -63,26 +72,55 @@ func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskError {
-	if info.Action == constant.TaskActionRemix {
-		var req relaycommon.TaskSubmitReq
-		if err := common.UnmarshalBodyReusable(c, &req); err != nil {
-			return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
-		}
-		if strings.TrimSpace(req.Prompt) == "" {
-			return service.TaskErrorWrapperLocal(fmt.Errorf("field prompt is required"), "invalid_request", http.StatusBadRequest)
-		}
-		c.Set("task_request", req)
-		return nil
+	if info.Action == constant.TaskActionRemix || c.GetBool("ali_passthrough") {
+		return service.TaskErrorWrapperLocal(fmt.Errorf("newapi tasks only support direct-URL video generation; remix and native Ali requests are not supported"), "unsupported_task_action", http.StatusBadRequest)
 	}
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/videos") {
-		return relaycommon.ValidateMultipartDirect(c, info)
+	contentType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		return service.TaskErrorWrapperLocal(fmt.Errorf("newapi video tasks require application/json"), "invalid_request", http.StatusBadRequest)
 	}
-	// 统一格式 /v1/video/generations（含 kling/jimeng/ali 中间件改写后的原生请求）
-	return relaycommon.ValidateBasicTaskRequest(c, info, constant.TaskActionGenerate)
+	var req relaycommon.TaskSubmitReq
+	if err := common.UnmarshalBodyReusable(c, &req); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if info.OriginModelName == "" {
+		info.OriginModelName = req.Model
+	}
+	if info.ChannelMeta == nil {
+		info.ChannelMeta = &relaycommon.ChannelMeta{}
+	}
+	// 验证渠道映射后的真实上游名称；后续通用提交流程仍按原模型配置价格。
+	info.UpstreamModelName = info.OriginModelName
+	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+		return service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+	}
+	if _, err := resolveTaskUpstream(info.ChannelBaseUrl); err != nil {
+		return service.TaskErrorWrapperLocal(err, "unsupported_task_upstream", http.StatusBadRequest)
+	}
+	if _, err := resolveTaskModel(info.ChannelBaseUrl, info.UpstreamModelName); err != nil {
+		return service.TaskErrorWrapperLocal(err, "unsupported_task_model", http.StatusBadRequest)
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	body, err := storage.Bytes()
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	req, err = parseTaskBillingRequest(body, info.ChannelBaseUrl, info.UpstreamModelName)
+	if err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_request", http.StatusBadRequest)
+	}
+	if err := validateTaskBillingConfig(info.ChannelBaseUrl, info.UpstreamModelName, info.OriginModelName); err != nil {
+		return service.TaskErrorWrapperLocal(err, "invalid_billing_config", http.StatusBadRequest)
+	}
+	info.Action = constant.TaskActionGenerate
+	c.Set("task_request", req)
+	return nil
 }
 
-// EstimateBilling 仿照 sora 适配器，根据 seconds 和 size 计算 OtherRatios，
-// size 倍率取自本包内置 videoSizeRatio 表。
+// EstimateBilling 按渠道 URL 和模型计算倍率，与实际上游请求共用已校验和迁移的参数。
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
 	if info.Action == constant.TaskActionRemix {
 		return nil
@@ -93,37 +131,21 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		return nil
 	}
 
-	seconds, _ := strconv.Atoi(req.Seconds)
-	if seconds == 0 {
-		seconds = req.Duration
+	ratios, err := estimateTaskBilling(info.ChannelBaseUrl, info.UpstreamModelName, req)
+	if err != nil {
+		return nil
 	}
-	if seconds <= 0 {
-		seconds = 4
-	}
-
-	size := req.Size
-	if size == "" {
-		size = "720x1280"
-	}
-
-	return ProcessNewAPIOtherRatios(info.UpstreamModelName, size, seconds)
-}
-
-// ProcessNewAPIOtherRatios 计算视频任务计费倍率：seconds 为实际时长，
-// size 倍率按模型从内置 videoSizeRatio 表查找（精确 → 最长前缀 → "*" 通配 → 1）。
-func ProcessNewAPIOtherRatios(model, size string, seconds int) map[string]float64 {
-	return map[string]float64{
-		"seconds": float64(seconds),
-		"size":    getVideoSizeRatio(model, size),
-	}
+	return ratios
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if info.Action == constant.TaskActionRemix {
-		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
+		return "", fmt.Errorf("newapi task remix is not supported")
 	}
-	// 透传原始路径：/v1/videos 或 /v1/video/generations（原生路径已被中间件改写为后者）
-	return a.baseURL + info.RequestURLPath, nil
+	if _, err := resolveTaskUpstream(a.baseURL); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(a.baseURL, "/") + "/v1/video/generations", nil
 }
 
 func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) error {
@@ -133,79 +155,21 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
 }
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
-	storage, err := common.GetBodyStorage(c)
+	req, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
-		return nil, errors.Wrap(err, "get_request_body_failed")
+		return nil, err
 	}
-	cachedBody, err := storage.Bytes()
+	if _, err := estimateTaskBilling(info.ChannelBaseUrl, info.UpstreamModelName, req); err != nil {
+		return nil, err
+	}
+	// 请求结构和媒体迁移由模型分支确定，这里只序列化同一份已校验参数。
+	// 保留完整上游模型名称，包含其路径和后缀。
+	req.Model = info.UpstreamModelName
+	body, err := common.Marshal(req)
 	if err != nil {
-		return nil, errors.Wrap(err, "read_body_bytes_failed")
+		return nil, errors.Wrap(err, "marshal_request_failed")
 	}
-	contentType := c.GetHeader("Content-Type")
-
-	if strings.HasPrefix(contentType, "application/json") {
-		var bodyMap map[string]interface{}
-		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
-			bodyMap["model"] = info.UpstreamModelName
-			if newBody, err := common.Marshal(bodyMap); err == nil {
-				return bytes.NewReader(newBody), nil
-			}
-		}
-		return bytes.NewReader(cachedBody), nil
-	}
-
-	if strings.Contains(contentType, "multipart/form-data") {
-		formData, err := common.ParseMultipartFormReusable(c)
-		if err != nil {
-			return bytes.NewReader(cachedBody), nil
-		}
-		var buf bytes.Buffer
-		writer := multipart.NewWriter(&buf)
-		writer.WriteField("model", info.UpstreamModelName)
-		for key, values := range formData.Value {
-			if key == "model" {
-				continue
-			}
-			for _, v := range values {
-				writer.WriteField(key, v)
-			}
-		}
-		for fieldName, fileHeaders := range formData.File {
-			for _, fh := range fileHeaders {
-				f, err := fh.Open()
-				if err != nil {
-					continue
-				}
-				ct := fh.Header.Get("Content-Type")
-				if ct == "" || ct == "application/octet-stream" {
-					buf512 := make([]byte, 512)
-					n, _ := io.ReadFull(f, buf512)
-					ct = http.DetectContentType(buf512[:n])
-					// 重新打开文件，保证后续完整拷贝内容
-					f.Close()
-					f, err = fh.Open()
-					if err != nil {
-						continue
-					}
-				}
-				h := make(textproto.MIMEHeader)
-				h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, fh.Filename))
-				h.Set("Content-Type", ct)
-				part, err := writer.CreatePart(h)
-				if err != nil {
-					f.Close()
-					continue
-				}
-				io.Copy(part, f)
-				f.Close()
-			}
-		}
-		writer.Close()
-		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-		return &buf, nil
-	}
-
-	return common.NewReplayableBodyReader(storage), nil
+	return bytes.NewReader(body), nil
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
@@ -213,12 +177,12 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
 	}
-	_ = resp.Body.Close()
 
 	var dResp responseTask
 	if err := common.Unmarshal(responseBody, &dResp); err != nil {
@@ -235,21 +199,36 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 		return
 	}
 
-	// 返回给客户端的是本站公开 task_xxxx ID
-	dResp.ID = info.PublicTaskID
-	dResp.TaskID = info.PublicTaskID
-	c.JSON(http.StatusOK, dResp)
+	// 保留上游扩展字段，客户端只看到本站公开 ID 和原始模型名。
+	publicTask := &model.Task{
+		TaskID:     info.PublicTaskID,
+		Data:       responseBody,
+		Properties: model.Properties{OriginModelName: info.OriginModelName},
+	}
+	var publicBody []byte
+	if c.GetBool("ali_passthrough") {
+		publicBody, err = a.ConvertToAliVideo(publicTask)
+	} else {
+		publicBody, err = a.ConvertToOpenAIVideo(publicTask)
+	}
+	if err != nil {
+		return "", nil, service.TaskErrorWrapper(err, "convert_response_failed", http.StatusInternalServerError)
+	}
+	c.Data(http.StatusOK, "application/json", publicBody)
 	return upstreamID, responseBody, nil
 }
 
-// FetchTask 通过上游 /v1/videos/{task_id} 查询任务状态（后台轮询使用）。
+// FetchTask 通过上游 /v1/video/generations/{task_id} 查询任务状态。
 func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+	if _, err := resolveTaskUpstream(baseUrl); err != nil {
+		return nil, err
+	}
 	taskID, ok := body["task_id"].(string)
-	if !ok {
+	if !ok || strings.TrimSpace(taskID) == "" {
 		return nil, fmt.Errorf("invalid task_id")
 	}
 
-	uri := fmt.Sprintf("%s/v1/videos/%s", baseUrl, taskID)
+	uri := fmt.Sprintf("%s/v1/video/generations/%s", strings.TrimRight(baseUrl, "/"), url.PathEscape(taskID))
 
 	req, err := http.NewRequest(http.MethodGet, uri, nil)
 	if err != nil {
@@ -291,7 +270,14 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusInProgress
 	case "completed":
 		taskResult.Status = model.TaskStatusSuccess
-		// Url 留空，由调用方基于公开 task ID 构造代理下载地址
+		taskResult.Url = resTask.Output.VideoURL
+		if taskResult.Url == "" {
+			taskResult.Url = resTask.Metadata.URL
+		}
+		videoURL, err := url.Parse(taskResult.Url)
+		if err != nil || videoURL.Host == "" || (videoURL.Scheme != "https" && videoURL.Scheme != "http") {
+			return nil, fmt.Errorf("completed newapi task has no directly downloadable HTTP(S) video URL")
+		}
 	case "failed", "cancelled":
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
@@ -310,9 +296,79 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	data := task.Data
-	var err error
-	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
-		return nil, errors.Wrap(err, "set id failed")
+	fields := map[string]any{"id": task.TaskID, "task_id": task.TaskID}
+	if task.Properties.OriginModelName != "" {
+		fields["model"] = task.Properties.OriginModelName
+	}
+	if task.Progress != "" {
+		if progress, err := strconv.Atoi(strings.TrimSuffix(task.Progress, "%")); err == nil {
+			fields["progress"] = min(max(progress, 0), 100)
+		}
+	}
+	switch task.Status {
+	case model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued:
+		fields["status"] = "queued"
+	case model.TaskStatusInProgress:
+		fields["status"] = "in_progress"
+	case model.TaskStatusSuccess:
+		fields["status"] = "completed"
+		fields["progress"] = 100
+		videoURL := task.PrivateData.ResultURL
+		if videoURL == "" {
+			result, err := a.ParseTaskResult(task.Data)
+			if err != nil {
+				return nil, err
+			}
+			videoURL = result.Url
+		}
+		if videoURL == "" {
+			return nil, fmt.Errorf("completed newapi task has no video URL")
+		}
+		fields["output.video_url"] = videoURL
+		fields["metadata.url"] = videoURL
+	case model.TaskStatusFailure:
+		fields["status"] = "failed"
+		fields["progress"] = 100
+		if task.FailReason != "" {
+			fields["error.message"] = task.FailReason
+		}
+	}
+	for path, value := range fields {
+		var err error
+		data, err = sjson.SetBytes(data, path, value)
+		if err != nil {
+			return nil, errors.Wrapf(err, "set %s failed", path)
+		}
 	}
 	return data, nil
+}
+
+func (a *TaskAdaptor) ConvertToAliVideo(task *model.Task) ([]byte, error) {
+	data, err := a.ConvertToOpenAIVideo(task)
+	if err != nil {
+		return nil, err
+	}
+	var video responseTask
+	if err := common.Unmarshal(data, &video); err != nil {
+		return nil, errors.Wrap(err, "unmarshal video response failed")
+	}
+	response := ali.AliVideoResponse{Output: ali.AliVideoOutput{TaskID: task.TaskID}}
+	switch video.Status {
+	case "queued", "pending", "submitted":
+		response.Output.TaskStatus = "PENDING"
+	case "processing", "in_progress":
+		response.Output.TaskStatus = "RUNNING"
+	case "completed":
+		response.Output.TaskStatus = "SUCCEEDED"
+		response.Output.VideoURL = video.Output.VideoURL
+	case "failed", "cancelled":
+		response.Output.TaskStatus = "FAILED"
+	default:
+		response.Output.TaskStatus = "UNKNOWN"
+	}
+	if video.Error != nil {
+		response.Output.Code = video.Error.Code
+		response.Output.Message = video.Error.Message
+	}
+	return common.Marshal(response)
 }

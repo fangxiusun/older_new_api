@@ -9,6 +9,8 @@ var ModelList = []string{
 	"doubao-seedance-1-5-pro-251215",
 	"doubao-seedance-2-0-260128",
 	"doubao-seedance-2-0-fast-260128",
+	"doubao-seedance-2-0-mini-260615",
+	"doubao-seedance-2-5-260628",
 }
 
 var ChannelName = "doubao-video"
@@ -24,6 +26,12 @@ type videoPriceKey struct {
 // 其中零值键 {480p/720p, 不含视频} 为基准价，等于管理员应配置的 ModelRatio；
 // 计费时取 实际单价/基准价 作为 OtherRatio。
 var videoPriceTable = map[string]map[videoPriceKey]float64{
+	"doubao-seedance-2-5-260628": {
+		{hasVideo: false}:                70.0,
+		{hasVideo: true}:                 42.0,
+		{is1080p: true, hasVideo: false}: 77.0,
+		{is1080p: true, hasVideo: true}:  46.0,
+	},
 	"doubao-seedance-2-0-260128": {
 		{hasVideo: false}:                46.0,
 		{hasVideo: true}:                 28.0,
@@ -35,6 +43,10 @@ var videoPriceTable = map[string]map[videoPriceKey]float64{
 	"doubao-seedance-2-0-fast-260128": {
 		{hasVideo: false}: 37.0,
 		{hasVideo: true}:  22.0,
+	},
+	"doubao-seedance-2-0-mini-260615": {
+		{hasVideo: false}: 23.0,
+		{hasVideo: true}:  14.0,
 	},
 }
 
