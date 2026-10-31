@@ -1090,9 +1090,9 @@ func ProcessAliOtherRatios(model, size, resolution string, audio *bool) (map[str
 		"happyhorse-1.0-r2v":        {"720P": 1, "1080P": 1.6 / 0.9},
 		"happyhorse-1.0-video-edit": {"720P": 1, "1080P": 1.6 / 0.9},
 
-		"happyhorse-1.1-t2v": {"720P": 1, "1080P": 1.2 / 0.9},
-		"happyhorse-1.1-i2v": {"720P": 1, "1080P": 1.2 / 0.9},
-		"happyhorse-1.1-r2v": {"720P": 1, "1080P": 1.2 / 0.9},
+		"happyhorse-1.1-t2v": {"720P": 1, "480P": 0.5, "1080P": 1.2 / 0.9},
+		"happyhorse-1.1-i2v": {"720P": 1, "480P": 0.5, "1080P": 1.2 / 0.9},
+		"happyhorse-1.1-r2v": {"720P": 1, "480P": 0.5, "1080P": 1.2 / 0.9},
 
 		"wan2.2-s2v": {"480P": 1, "720P": 0.9 / 0.5},
 	}
